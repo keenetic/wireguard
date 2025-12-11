@@ -5,6 +5,7 @@
 
 #include "netlink.h"
 #include "device.h"
+#include "magic_header.h"
 #include "peer.h"
 #include "socket.h"
 #include "queueing.h"
@@ -31,10 +32,18 @@ static const struct nla_policy device_policy[WGDEVICE_A_MAX + 1] = {
 	[WGDEVICE_A_JMAX]		= { .type = NLA_U16 },
 	[WGDEVICE_A_S1]		= { .type = NLA_U16 },
 	[WGDEVICE_A_S2]		= { .type = NLA_U16 },
-	[WGDEVICE_A_H1]		= { .type = NLA_U32 },
-	[WGDEVICE_A_H2]		= { .type = NLA_U32 },
-	[WGDEVICE_A_H3]		= { .type = NLA_U32 },
-	[WGDEVICE_A_H4]		= { .type = NLA_U32 }
+	[WGDEVICE_A_H1]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_H2]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_H3]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_H4]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_S3]		= { .type = NLA_U16 },
+	[WGDEVICE_A_S4]		= { .type = NLA_U16 },
+	[WGDEVICE_A_I1]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_I2]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_I3]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_I4]		= { .type = NLA_NUL_STRING },
+	[WGDEVICE_A_I5]		= { .type = NLA_NUL_STRING }
+
 };
 
 static const struct nla_policy device_policy_debug[WGDEVICE_A_MAX + 1] = {
@@ -55,7 +64,8 @@ static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
 	[WGPEER_A_ALLOWEDIPS]				= { .type = NLA_NESTED },
 	[WGPEER_A_FWMARK]				= { .type = NLA_U32 },
 	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 },
-	[WGPEER_A_CLIENT_ID]				= { .type = NLA_U32 }
+	[WGPEER_A_CLIENT_ID]				= { .type = NLA_U32 },
+	[WGPEER_A_ADVANCED_SECURITY]    		= { .type = NLA_FLAG }
 };
 
 static const struct nla_policy allowedip_policy[WGALLOWEDIP_A_MAX + 1] = {
@@ -127,6 +137,16 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 
 	if (!peer_nest)
 		return -EMSGSIZE;
+
+	fail = nla_put_u32(skb, WGPEER_A_FLAGS, WGPEER_F_HAS_ADVANCED_SECURITY);
+	if (fail)
+		goto err;
+
+	if (peer->advanced_security) {
+		fail = nla_put_flag(skb, WGPEER_A_ADVANCED_SECURITY);
+		if (fail)
+			goto err;
+	}
 
 	down_read(&peer->handshake.lock);
 	fail = nla_put(skb, WGPEER_A_PUBLIC_KEY, NOISE_PUBLIC_KEY_LEN,
@@ -231,6 +251,7 @@ static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
 	int ret = -EMSGSIZE;
 	bool done = true;
 	void *hdr;
+	char buf[32];
 
 	rtnl_lock();
 	mutex_lock(&wg->device_update_lock);
@@ -248,7 +269,32 @@ static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
 				wg->incoming_port) ||
 		    nla_put_u32(skb, WGDEVICE_A_FWMARK, wg->fwmark) ||
 		    nla_put_u32(skb, WGDEVICE_A_IFINDEX, wg->dev->ifindex) ||
-		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name))
+		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name) ||
+		    nla_put_u16(skb, WGDEVICE_A_JC, wg->jc) ||
+		    nla_put_u16(skb, WGDEVICE_A_JMIN, wg->jmin) ||
+		    nla_put_u16(skb, WGDEVICE_A_JMAX, wg->jmax) ||
+		    nla_put_u16(skb, WGDEVICE_A_S1, wg->junk_size[MSGIDX_HANDSHAKE_INIT]) ||
+		    nla_put_u16(skb, WGDEVICE_A_S2,wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]) ||
+		    (mh_genspec(&wg->headers[MSGIDX_HANDSHAKE_INIT], buf, sizeof(buf)) &&
+				nla_put_string(skb, WGDEVICE_A_H1, buf)) ||
+			(mh_genspec(&wg->headers[MSGIDX_HANDSHAKE_RESPONSE], buf, sizeof(buf)) &&
+				nla_put_string(skb, WGDEVICE_A_H2, buf)) ||
+			(mh_genspec(&wg->headers[MSGIDX_HANDSHAKE_COOKIE], buf, sizeof(buf)) &&
+				nla_put_string(skb, WGDEVICE_A_H3, buf)) ||
+			(mh_genspec(&wg->headers[MSGIDX_TRANSPORT], buf, sizeof(buf)) &&
+				nla_put_string(skb, WGDEVICE_A_H4, buf)) ||
+			nla_put_u16(skb, WGDEVICE_A_S3, wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]) ||
+			nla_put_u16(skb, WGDEVICE_A_S4, wg->junk_size[MSGIDX_TRANSPORT]) ||
+			(wg->ispecs[0].desc &&
+				nla_put_string(skb, WGDEVICE_A_I1, wg->ispecs[0].desc)) ||
+			(wg->ispecs[1].desc &&
+				nla_put_string(skb, WGDEVICE_A_I2, wg->ispecs[1].desc)) ||
+			(wg->ispecs[2].desc &&
+				nla_put_string(skb, WGDEVICE_A_I3, wg->ispecs[2].desc)) ||
+			(wg->ispecs[3].desc &&
+				nla_put_string(skb, WGDEVICE_A_I4, wg->ispecs[3].desc)) ||
+			(wg->ispecs[4].desc &&
+				nla_put_string(skb, WGDEVICE_A_I5, wg->ispecs[4].desc)))
 			goto out;
 
 		down_read(&wg->static_identity.lock);
@@ -509,6 +555,11 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		peer->client_id = nla_get_u32(attrs[WGPEER_A_CLIENT_ID]);
 	}
 
+	if (flags & WGPEER_F_HAS_ADVANCED_SECURITY) {
+		peer->advanced_security = wg->advanced_security &&
+				nla_get_flag(attrs[WGPEER_A_ADVANCED_SECURITY]);
+	}
+
 	if (netif_running(wg->dev))
 		wg_packet_send_staged_packets(peer);
 
@@ -523,11 +574,11 @@ out:
 static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
 {
 	struct wg_device *wg = lookup_interface(info->attrs, skb);
-	struct asc_config *asc = kzalloc(sizeof(*asc), GFP_KERNEL);
 	u32 flags = 0;
 	int ret;
+	char *str;
 
-	if (IS_ERR(wg) || !asc) {
+	if (IS_ERR(wg)) {
 		ret = PTR_ERR(wg);
 		goto out_nodev;
 	}
@@ -569,48 +620,99 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	if (info->attrs[WGDEVICE_A_JC]) {
-		asc->advanced_security_enabled = true;
-		asc->junk_packet_count = nla_get_u16(info->attrs[WGDEVICE_A_JC]);
+		wg->advanced_security = true;
+		wg->jc = nla_get_u16(info->attrs[WGDEVICE_A_JC]);
 	}
 
 	if (info->attrs[WGDEVICE_A_JMIN]) {
-		asc->advanced_security_enabled = true;
-		asc->junk_packet_min_size = nla_get_u16(info->attrs[WGDEVICE_A_JMIN]);
+		wg->advanced_security = true;
+		wg->jmin = nla_get_u16(info->attrs[WGDEVICE_A_JMIN]);
 	}
 
 	if (info->attrs[WGDEVICE_A_JMAX]) {
-		asc->advanced_security_enabled = true;
-		asc->junk_packet_max_size = nla_get_u16(info->attrs[WGDEVICE_A_JMAX]);
+		wg->advanced_security = true;
+		wg->jmax = nla_get_u16(info->attrs[WGDEVICE_A_JMAX]);
 	}
 
 	if (info->attrs[WGDEVICE_A_S1]) {
-		asc->advanced_security_enabled = true;
-		asc->init_packet_junk_size = nla_get_u16(info->attrs[WGDEVICE_A_S1]);
+		wg->advanced_security = true;
+		wg->junk_size[MSGIDX_HANDSHAKE_INIT] = nla_get_u16(info->attrs[WGDEVICE_A_S1]);
 	}
 
 	if (info->attrs[WGDEVICE_A_S2]) {
-		asc->advanced_security_enabled = true;
-		asc->response_packet_junk_size = nla_get_u16(info->attrs[WGDEVICE_A_S2]);
+		wg->advanced_security = true;
+		wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE] = nla_get_u16(info->attrs[WGDEVICE_A_S2]);
 	}
 
 	if (info->attrs[WGDEVICE_A_H1]) {
-		asc->advanced_security_enabled = true;
-		asc->init_packet_magic_header = nla_get_u32(info->attrs[WGDEVICE_A_H1]);
+		wg->advanced_security = true;
+		str = nla_strdup(info->attrs[WGDEVICE_A_H1], GFP_KERNEL);
+		ret = mh_parse(&wg->headers[MSGIDX_HANDSHAKE_INIT], str);
+		kfree(str);
+		if (ret)
+			goto out;
 	}
 
 	if (info->attrs[WGDEVICE_A_H2]) {
-		asc->advanced_security_enabled = true;
-		asc->response_packet_magic_header = nla_get_u32(info->attrs[WGDEVICE_A_H2]);
+		wg->advanced_security = true;
+		str = nla_strdup(info->attrs[WGDEVICE_A_H2], GFP_KERNEL);
+		ret = mh_parse(&wg->headers[MSGIDX_HANDSHAKE_RESPONSE], str);
+		kfree(str);
+		if (ret)
+			goto out;
 	}
 
 	if (info->attrs[WGDEVICE_A_H3]) {
-		asc->advanced_security_enabled = true;
-		asc->cookie_packet_magic_header = nla_get_u32(info->attrs[WGDEVICE_A_H3]);
+		wg->advanced_security = true;
+		str = nla_strdup(info->attrs[WGDEVICE_A_H3], GFP_KERNEL);
+		ret = mh_parse(&wg->headers[MSGIDX_HANDSHAKE_COOKIE], str);
+		kfree(str);
+		if (ret)
+			goto out;
 	}
 
 	if (info->attrs[WGDEVICE_A_H4]) {
-		asc->advanced_security_enabled = true;
-		asc->transport_packet_magic_header = nla_get_u32(info->attrs[WGDEVICE_A_H4]);
+		wg->advanced_security = true;
+		str = nla_strdup(info->attrs[WGDEVICE_A_H4], GFP_KERNEL);
+		ret = mh_parse(&wg->headers[MSGIDX_TRANSPORT], str);
+		kfree(str);
+		if (ret)
+			goto out;
+	}
+
+	if (info->attrs[WGDEVICE_A_S3]) {
+		wg->advanced_security = true;
+		wg->junk_size[MSGIDX_HANDSHAKE_COOKIE] = nla_get_u16(info->attrs[WGDEVICE_A_S3]);
+	}
+
+	if (info->attrs[WGDEVICE_A_S4]) {
+		wg->advanced_security = true;
+		wg->junk_size[MSGIDX_TRANSPORT] = nla_get_u16(info->attrs[WGDEVICE_A_S4]);
+	}
+
+	if (info->attrs[WGDEVICE_A_I1]) {
+		wg->advanced_security = true;
+		wg->ispecs[0].desc = nla_strdup(info->attrs[WGDEVICE_A_I1], GFP_KERNEL);
+	}
+
+	if (info->attrs[WGDEVICE_A_I2]) {
+		wg->advanced_security = true;
+		wg->ispecs[1].desc = nla_strdup(info->attrs[WGDEVICE_A_I2], GFP_KERNEL);
+	}
+
+	if (info->attrs[WGDEVICE_A_I3]) {
+		wg->advanced_security = true;
+		wg->ispecs[2].desc = nla_strdup(info->attrs[WGDEVICE_A_I3], GFP_KERNEL);
+	}
+
+	if (info->attrs[WGDEVICE_A_I4]) {
+		wg->advanced_security = true;
+		wg->ispecs[3].desc = nla_strdup(info->attrs[WGDEVICE_A_I4], GFP_KERNEL);
+	}
+
+	if (info->attrs[WGDEVICE_A_I5]) {
+		wg->advanced_security = true;
+		wg->ispecs[4].desc = nla_strdup(info->attrs[WGDEVICE_A_I5], GFP_KERNEL);
 	}
 
 	if (flags & WGDEVICE_F_REPLACE_PEERS)
@@ -656,6 +758,10 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
 	}
 skip_set_private_key:
 
+	ret = wg_device_handle_post_config(wg);
+	if (ret < 0)
+		goto out;
+
 	if (info->attrs[WGDEVICE_A_PEERS]) {
 		struct nlattr *attr, *peer[WGPEER_A_MAX + 1];
 		int rem;
@@ -670,14 +776,13 @@ skip_set_private_key:
 				goto out;
 		}
 	}
-	ret = wg_device_handle_post_config(wg->dev, asc);
-
+	ret = 0;
+	
 out:
 	mutex_unlock(&wg->device_update_lock);
 	rtnl_unlock();
 	dev_put(wg->dev);
 out_nodev:
-	kfree(asc);
 	if (info->attrs[WGDEVICE_A_PRIVATE_KEY])
 		memzero_explicit(nla_data(info->attrs[WGDEVICE_A_PRIVATE_KEY]),
 				 nla_len(info->attrs[WGDEVICE_A_PRIVATE_KEY]));

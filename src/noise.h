@@ -118,20 +118,18 @@ void wg_noise_precompute_static_static(struct wg_peer *peer);
 
 bool
 wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
-				     struct noise_handshake *handshake,
-				     u32 message_type);
+					struct noise_handshake *handshake, u32 message_type)
 struct wg_peer *
 wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
-				      struct wg_device *wg);
+					struct wg_device *wg, struct sk_buff *skb);
 
 bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
-					struct noise_handshake *handshake,
-					u32 message_type);
+					struct noise_handshake *handshake, u32 message_type);
 struct wg_peer *
 wg_noise_handshake_consume_response(struct message_handshake_response *src,
-				    struct wg_device *wg);
+					struct wg_device *wg);
 
 bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
-				      struct noise_keypairs *keypairs);
+					struct noise_keypairs *keypairs);
 
 #endif /* _WG_NOISE_H */

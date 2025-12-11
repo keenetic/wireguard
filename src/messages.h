@@ -61,6 +61,13 @@ enum message_type {
 	MESSAGE_DATA = 4
 };
 
+enum message_index {
+	MSGIDX_HANDSHAKE_INIT = MESSAGE_HANDSHAKE_INITIATION - 1,
+	MSGIDX_HANDSHAKE_RESPONSE = MESSAGE_HANDSHAKE_RESPONSE - 1,
+	MSGIDX_HANDSHAKE_COOKIE = MESSAGE_HANDSHAKE_COOKIE - 1,
+	MSGIDX_TRANSPORT = MESSAGE_DATA - 1
+};
+
 struct message_header {
 	/* The actual layout of this that we want is:
 	 * u8 type
@@ -124,6 +131,18 @@ enum message_size {
 	MESSAGE_TRANSPORT_SIZE = sizeof(struct message_data),
 	MESSAGE_MAX_SIZE = 65535
 };
+
+static inline bool client_id_asc_coexist(struct wg_device *wg)
+{
+	return
+		wg->wg->headers[MSGIDX_HANDSHAKE_INIT].start <= 0xFF &&
+		wg->wg->headers[MSGIDX_HANDSHAKE_RESPONSE].start <= 0xFF &&
+		wg->wg->headers[MSGIDX_HANDSHAKE_COOKIE].start <= 0xFF &&
+		wg->wg->headers[MSGIDX_TRANSPORT].start <= 0xFF;
+}
+
+#define SKB_TYPE_LE32(skb, wg) ((((struct message_header *)(skb)->data)->type) & (!client_id_asc_coexist(wg) ? 0xFFFFFFFF : cpu_to_le32(0xFF)))
+#define SKB_CLEAR_TYPE(skb, wg) ((((struct message_header *)(skb)->data)->type) &= (!client_id_asc_coexist(wg) ? 0xFFFFFFFF : cpu_to_le32(0xFF)))
 
 #define SKB_HEADER_LEN                                       \
 	(max(sizeof(struct iphdr), sizeof(struct ipv6hdr)) + \

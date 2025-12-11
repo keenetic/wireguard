@@ -3,6 +3,7 @@
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
+#include "junk.h"
 #include "queueing.h"
 #include "socket.h"
 #include "timers.h"
@@ -106,9 +107,6 @@ static int wg_pm_notification(struct notifier_block *nb, unsigned long action,
 	rcu_barrier();
 	return 0;
 }
-
-static struct notifier_block pm_notifier = { .notifier_call = wg_pm_notification };
-#endif
 
 static int wg_stop(struct net_device *dev)
 {
@@ -249,6 +247,10 @@ static const struct net_device_ops netdev_ops = {
 static void wg_destruct(struct net_device *dev)
 {
 	struct wg_device *wg = netdev_priv(dev);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(wg->ispecs); ++i)
+		jp_spec_free(&wg->ispecs[i]);
 
 	rtnl_lock();
 	list_del(&wg->device_list);
@@ -317,6 +319,23 @@ static void wg_setup(struct net_device *dev)
 
 	memset(wg, 0, sizeof(*wg));
 	wg->dev = dev;
+
+	wg->headers[MSGIDX_HANDSHAKE_INIT] = (struct magic_header) {
+		.start = MESSAGE_HANDSHAKE_INITIATION,
+		.end = MESSAGE_HANDSHAKE_INITIATION
+	};
+	wg->headers[MSGIDX_HANDSHAKE_RESPONSE] = (struct magic_header) {
+		.start = MESSAGE_HANDSHAKE_RESPONSE,
+		.end = MESSAGE_HANDSHAKE_RESPONSE
+	};
+	wg->headers[MSGIDX_HANDSHAKE_COOKIE] = (struct magic_header) {
+		.start = MESSAGE_HANDSHAKE_COOKIE,
+		.end = MESSAGE_HANDSHAKE_COOKIE
+	};
+	wg->headers[MSGIDX_TRANSPORT] = (struct magic_header) {
+		.start = MESSAGE_DATA,
+		.end = MESSAGE_DATA
+	};
 }
 
 static int wg_newlink(struct net *src_net, struct net_device *dev,
@@ -406,11 +425,6 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	 * register_netdevice doesn't call it for us if it fails.
 	 */
 	dev->priv_destructor = wg_destruct;
-
-	wg->advanced_security_config.init_packet_magic_header = MESSAGE_HANDSHAKE_INITIATION;
-	wg->advanced_security_config.response_packet_magic_header = MESSAGE_HANDSHAKE_RESPONSE;
-	wg->advanced_security_config.cookie_packet_magic_header = MESSAGE_HANDSHAKE_COOKIE;
-	wg->advanced_security_config.transport_packet_magic_header = MESSAGE_DATA;
 
 	pr_info("%s: interface created\n", wg->ndm_dev_name);
 	return ret;
@@ -517,152 +531,71 @@ void wg_device_uninit(void)
 	rcu_barrier();
 }
 
-static inline void wg_device_rollback(struct net_device *dev)
+int wg_device_handle_post_config(struct wg_device *wg)
 {
-	struct wg_device *wg = netdev_priv(dev);
+	int err;
+	int i, j;
 
-	memset(&wg->advanced_security_config, 0, sizeof(wg->advanced_security_config));
+	if (!wg->advanced_security)
+		return 0;
 
-	wg->advanced_security_config.init_packet_magic_header = MESSAGE_HANDSHAKE_INITIATION;
-	wg->advanced_security_config.response_packet_magic_header = MESSAGE_HANDSHAKE_RESPONSE;
-	wg->advanced_security_config.cookie_packet_magic_header = MESSAGE_HANDSHAKE_COOKIE;
-	wg->advanced_security_config.transport_packet_magic_header = MESSAGE_DATA;
-}
-
-int wg_device_handle_post_config(struct net_device *dev, struct asc_config *asc)
-{
-	struct wg_device *wg = netdev_priv(dev);
-	bool a_sec_on = false;
-	int ret = 0;
-
-	if (!asc->advanced_security_enabled)
-		goto out;
-
-	if (asc->junk_packet_count < 0) {
-		net_info_ratelimited("%s: JunkPacketCount should be non negative\n", dev->name);
-		ret = -EINVAL;
-		wg_device_rollback(dev);
-		goto out;
+	if (wg->jc < 0) {
+		net_info_ratelimited("%s: JunkPacketCount should be non negative\n", wg->dev->name);
+		return -EINVAL;
 	}
 
-	wg->advanced_security_config.junk_packet_count = asc->junk_packet_count;
-	if (asc->junk_packet_count != 0)
-		a_sec_on = true;
+	if (wg->jc && wg->jmin == wg->jmax)
+		wg->jmax++;
 
-	wg->advanced_security_config.junk_packet_min_size = asc->junk_packet_min_size;
-	if (asc->junk_packet_min_size != 0)
-		a_sec_on = true;
-
-	if (asc->junk_packet_count > 0 && asc->junk_packet_min_size == asc->junk_packet_max_size)
-		asc->junk_packet_max_size++;
-
-	if (asc->junk_packet_max_size >= MESSAGE_MAX_SIZE) {
-		wg->advanced_security_config.junk_packet_min_size = 0;
-		wg->advanced_security_config.junk_packet_max_size = 1;
-
+	if (wg->jmax >= MESSAGE_MAX_SIZE) {
 		net_info_ratelimited("%s: JunkPacketMaxSize: %d; should be smaller than maxSegmentSize: %d\n",
-							dev->name, asc->junk_packet_max_size,
-							MESSAGE_MAX_SIZE);
-		ret = -EINVAL;
-		wg_device_rollback(dev);
-		goto out;
+							wg->dev->name, wg->jmax, MESSAGE_MAX_SIZE);
+		return -EINVAL;
 	}
 
-	if (asc->junk_packet_max_size < asc->junk_packet_min_size) {
+	if (wg->jmax && wg->jmax < wg->jmin) {
 		net_info_ratelimited("%s: maxSize: %d; should be greater than minSize: %d\n",
-							dev->name, asc->junk_packet_max_size,
-							asc->junk_packet_min_size);
-		ret = -EINVAL;
-		wg_device_rollback(dev);
-		goto out;
+							wg->dev->name, wg->jmax, wg->jmin);
+		return -EINVAL;
 	}
 
-	wg->advanced_security_config.junk_packet_max_size = asc->junk_packet_max_size;
-
-	if (asc->junk_packet_max_size != 0)
-		a_sec_on = true;
-
-	if (asc->init_packet_junk_size + MESSAGE_INITIATION_SIZE >= MESSAGE_MAX_SIZE) {
-		net_info_ratelimited("%s: init header size (%d) + junkSize (%d) should be smaller than maxSegmentSize: %d\n",
-		                    dev->name, MESSAGE_INITIATION_SIZE,
-							asc->init_packet_junk_size, MESSAGE_MAX_SIZE);
-		ret = -EINVAL;
-		wg_device_rollback(dev);
-		goto out;
+	if (wg->junk_size[MSGIDX_HANDSHAKE_INIT] + MESSAGE_INITIATION_SIZE > MESSAGE_MAX_SIZE) {
+		net_info_ratelimited("%s: S1 is too large\n", wg->dev->name);
+		return -EINVAL;
 	}
 
-	wg->advanced_security_config.init_packet_junk_size = asc->init_packet_junk_size;
-
-	if (asc->init_packet_junk_size != 0)
-		a_sec_on = true;
-
-	if (asc->response_packet_junk_size + MESSAGE_RESPONSE_SIZE >= MESSAGE_MAX_SIZE) {
-		net_info_ratelimited("%s: response header size (%d) + junkSize (%d) should be smaller than maxSegmentSize: %d\n",
-		                    dev->name, MESSAGE_RESPONSE_SIZE,
-		                    asc->response_packet_junk_size, MESSAGE_MAX_SIZE);
-		ret = -EINVAL;
-		wg_device_rollback(dev);
-		goto out;
+	if (wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE] + MESSAGE_RESPONSE_SIZE > MESSAGE_MAX_SIZE) {
+		net_info_ratelimited("%s: S2 is too large\n", wg->dev->name);
+		return -EINVAL;
 	}
 
-	wg->advanced_security_config.response_packet_junk_size = asc->response_packet_junk_size;
-
-	if (asc->response_packet_junk_size != 0)
-		a_sec_on = true;
-
-	if (asc->init_packet_magic_header > MESSAGE_DATA) {
-		a_sec_on = true;
-		wg->advanced_security_config.init_packet_magic_header = asc->init_packet_magic_header;
+	if (wg->junk_size[MSGIDX_HANDSHAKE_COOKIE] + MESSAGE_COOKIE_REPLY_SIZE > MESSAGE_MAX_SIZE) {
+		net_info_ratelimited("%s: S3 is too large\n", wg->dev->name);
+		return -EINVAL;
 	}
 
-	if (asc->response_packet_magic_header > MESSAGE_DATA) {
-		a_sec_on = true;
-		wg->advanced_security_config.response_packet_magic_header = asc->response_packet_magic_header;
+	if (wg->junk_size[MSGIDX_TRANSPORT] + MESSAGE_TRANSPORT_SIZE > MESSAGE_MAX_SIZE) {
+		net_info_ratelimited("%s: S4 is too large\n", wg->dev->name);
+		return -EINVAL;
 	}
 
-	if (asc->cookie_packet_magic_header > MESSAGE_DATA) {
-		a_sec_on = true;
-		wg->advanced_security_config.cookie_packet_magic_header = asc->cookie_packet_magic_header;
+	for (i = 0; i < ARRAY_SIZE(wg->headers); ++i) {
+		for (j = i + 1; j < ARRAY_SIZE(wg->headers); ++j) {
+			if (!(wg->headers[j].end < wg->headers[i].start ||
+				  wg->headers[i].end < wg->headers[j].start)) {
+				net_info_ratelimited("%s: H%d and H%d ranges must not overlap\n", wg->dev->name, i + 1, j + 1);
+				return -EINVAL;
+			}
+		}
 	}
 
-	if (asc->transport_packet_magic_header > MESSAGE_DATA) {
-		a_sec_on = true;
-		wg->advanced_security_config.transport_packet_magic_header = asc->transport_packet_magic_header;
+	for (i = 0; i < ARRAY_SIZE(wg->ispecs); ++i) {
+		err = jp_spec_setup(&wg->ispecs[i]);
+		if (err) {
+			net_info_ratelimited("%s: I%d-packet invalid format\n", wg->dev->name, i + 1);
+			return err;
+		}
 	}
 
-	if (wg->advanced_security_config.init_packet_magic_header == wg->advanced_security_config.response_packet_magic_header ||
-			wg->advanced_security_config.init_packet_magic_header == wg->advanced_security_config.cookie_packet_magic_header ||
-			wg->advanced_security_config.init_packet_magic_header == wg->advanced_security_config.transport_packet_magic_header ||
-			wg->advanced_security_config.response_packet_magic_header == wg->advanced_security_config.cookie_packet_magic_header ||
-			wg->advanced_security_config.response_packet_magic_header == wg->advanced_security_config.transport_packet_magic_header ||
-			wg->advanced_security_config.cookie_packet_magic_header == wg->advanced_security_config.transport_packet_magic_header) {
-		net_info_ratelimited("%s: magic headers should differ; got: init:%d; recv:%d; unde:%d; tran:%d\n",
-		                    dev->name,
-							wg->advanced_security_config.init_packet_magic_header,
-		                    wg->advanced_security_config.response_packet_magic_header,
-							wg->advanced_security_config.cookie_packet_magic_header,
-							wg->advanced_security_config.transport_packet_magic_header);
-		ret = -EINVAL;
-		wg_device_rollback(dev);
-		goto out;
-	}
-
-	if (MESSAGE_INITIATION_SIZE + wg->advanced_security_config.init_packet_junk_size ==
-		MESSAGE_RESPONSE_SIZE + wg->advanced_security_config.response_packet_junk_size) {
-		net_info_ratelimited("%s: new init size:%d; and new response size:%d; should differ\n",
-		                    dev->name,
-		                    MESSAGE_INITIATION_SIZE + asc->init_packet_junk_size,
-		                    MESSAGE_RESPONSE_SIZE + asc->response_packet_junk_size);
-		ret = -EINVAL;
-		wg_device_rollback(dev);
-		goto out;
-	}
-
-	if (a_sec_on)
-		wg->advanced_security_config.advanced_security_enabled = a_sec_on;
-	else
-		wg_device_rollback(dev);
-
-out:
-	return ret;
+	return 0;
 }

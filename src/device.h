@@ -6,10 +6,12 @@
 #ifndef _WG_DEVICE_H
 #define _WG_DEVICE_H
 
+#include "junk.h"
 #include "noise.h"
 #include "allowedips.h"
 #include "peerlookup.h"
 #include "cookie.h"
+#include "magic_header.h"
 
 #include <linux/types.h>
 #include <linux/netdevice.h>
@@ -39,19 +41,6 @@ struct prev_queue {
 	atomic_t count;
 };
 
-struct asc_config {
-	bool advanced_security_enabled;
-	u16 junk_packet_count;
-	u16 junk_packet_min_size;
-	u16 junk_packet_max_size;
-	u16 init_packet_junk_size;
-	u16 response_packet_junk_size;
-	u32 init_packet_magic_header;
-	u32 response_packet_magic_header;
-	u32 cookie_packet_magic_header;
-	u32 transport_packet_magic_header;
-};
-
 struct wg_device {
 	struct net_device *dev;
 	struct crypt_queue encrypt_queue, decrypt_queue, handshake_queue;
@@ -65,7 +54,6 @@ struct wg_device {
 	struct allowedips peer_allowedips;
 	struct mutex device_update_lock, socket_update_lock;
 	struct list_head device_list, peer_list;
-	struct asc_config advanced_security_config;
 	atomic_t handshake_queue_len;
 	unsigned int num_peers, device_update_gen;
 	u32 fwmark;
@@ -73,10 +61,18 @@ struct wg_device {
 	bool have_creating_net_ref;
 	bool debug;
 	char ndm_dev_name[WG_NDM_NAME_SIZE];
+
+	struct jp_spec ispecs[5];
+	struct magic_header headers[4];
+	u16 junk_size[4];
+	u16 jc;
+	u16 jmin;
+	u16 jmax;
+	bool advanced_security;
 };
 
 int wg_device_init(void);
 void wg_device_uninit(void);
-int wg_device_handle_post_config(struct net_device *dev, struct asc_config *asc);
+int wg_device_handle_post_config(struct wg_device *wg);
 
 #endif /* _WG_DEVICE_H */

@@ -10,6 +10,7 @@
 #include "messages.h"
 #include "cookie.h"
 #include "socket.h"
+#include "magic_header.h"
 
 #include <linux/simd.h>
 #include <linux/ip.h>
@@ -35,72 +36,52 @@ static void update_rx_stats(struct wg_peer *peer, size_t len)
 	put_cpu_ptr(tstats);
 }
 
-static inline bool client_id_asc_coexist(struct wg_device *wg)
-{
-	return
-		wg->advanced_security_config.init_packet_magic_header <= 0xFF &&
-		wg->advanced_security_config.response_packet_magic_header <= 0xFF &&
-		wg->advanced_security_config.cookie_packet_magic_header <= 0xFF &&
-		wg->advanced_security_config.transport_packet_magic_header <= 0xFF;
-}
-
-#define SKB_TYPE_LE32(skb, wg) ((((struct message_header *)(skb)->data)->type) & (!client_id_asc_coexist(wg) ? 0xFFFFFFFF : cpu_to_le32(0xFF)))
-#define SKB_CLEAR_TYPE(skb, wg) ((((struct message_header *)(skb)->data)->type) &= (!client_id_asc_coexist(wg) ? 0xFFFFFFFF : cpu_to_le32(0xFF)))
-
-static size_t validate_header_len(struct sk_buff *skb, struct wg_device *wg)
-{
-	__le32 type = 0;
-
-	if (unlikely(skb->len < sizeof(struct message_header)))
-		return 0;
-
-	type = SKB_TYPE_LE32(skb, wg);
-
-	if (type == cpu_to_le32(wg->advanced_security_config.transport_packet_magic_header) &&
-	    skb->len >= MESSAGE_MINIMUM_LENGTH)
-		return sizeof(struct message_data);
-	if (type == cpu_to_le32(wg->advanced_security_config.init_packet_magic_header) &&
-	    skb->len == MESSAGE_INITIATION_SIZE)
-		return MESSAGE_INITIATION_SIZE;
-	if (type == cpu_to_le32(wg->advanced_security_config.response_packet_magic_header) &&
-	    skb->len == MESSAGE_RESPONSE_SIZE)
-		return MESSAGE_RESPONSE_SIZE;
-	if (type == cpu_to_le32(wg->advanced_security_config.cookie_packet_magic_header) &&
-	    skb->len == MESSAGE_COOKIE_REPLY_SIZE)
-		return MESSAGE_COOKIE_REPLY_SIZE;
-	return 0;
-}
-
-void prepare_advanced_secured_message(struct sk_buff *skb, struct wg_device *wg)
+static size_t prepare_awg_message(struct sk_buff *skb, struct wg_device *wg)
 {
 	u32 assumed_type = SKB_TYPE_LE32(skb, wg);
-	u32 assumed_offset;
 
-	if (wg->advanced_security_config.advanced_security_enabled) {
-		if (skb->len == MESSAGE_INITIATION_SIZE + wg->advanced_security_config.init_packet_junk_size) {
-			assumed_type = cpu_to_le32(wg->advanced_security_config.init_packet_magic_header);
-			assumed_offset = wg->advanced_security_config.init_packet_junk_size;
-		} else if (skb->len == MESSAGE_RESPONSE_SIZE + wg->advanced_security_config.response_packet_junk_size) {
-			assumed_type = cpu_to_le32(wg->advanced_security_config.response_packet_magic_header);
-			assumed_offset = wg->advanced_security_config.response_packet_junk_size;
-		} else
-			return;
-
-		if (unlikely(assumed_offset <= 0) || unlikely(!pskb_may_pull(skb, assumed_offset)))
-			return;
-
-		net_dbg_skb_ratelimited("%s: Likely received handshake packet from %pISpfsc, assuming its type %l with offset %l (current type %l)\n",
-		                        wg->dev->name, skb, assumed_type, assumed_offset, SKB_TYPE_LE32(skb, wg));
-
-		skb_pull(skb, assumed_offset);
-
-		net_dbg_skb_ratelimited("%s: Packet from %pISpfsc real type after skb_pull %l\n",
-		                        wg->dev->name, skb, SKB_TYPE_LE32(skb, wg));
-
-		if (SKB_TYPE_LE32(skb, wg) != assumed_type) {
-			skb_push(skb, assumed_offset);
-		}
+	if (skb_is_nonlinear(skb) && unlikely(skb_linearize(skb))) {
+		net_dbg_skb_ratelimited("%s: non-linear sk_buff from %pISpfsc could not be linearized, dropping packet\n",
+								wg->dev->name, skb);
+		return 0;
 	}
+	
+	if (skb->len == wg->junk_size[MSGIDX_HANDSHAKE_INIT] + MESSAGE_INITIATION_SIZE) {
+		skb_pull(skb, wg->junk_size[MSGIDX_HANDSHAKE_INIT]);
+		if (mh_validate(assumed_type, &wg->headers[MSGIDX_HANDSHAKE_INIT]))
+			return MESSAGE_INITIATION_SIZE;
+		else
+			skb_push(skb, wg->junk_size[MSGIDX_HANDSHAKE_INIT]);
+	}
+
+	if (skb->len == wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE] + MESSAGE_RESPONSE_SIZE) {
+		skb_pull(skb, wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]);
+		if (mh_validate(assumed_type, &wg->headers[MSGIDX_HANDSHAKE_RESPONSE]))
+			return MESSAGE_RESPONSE_SIZE;
+		else
+			skb_push(skb, wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]);
+	}
+
+	if (skb->len == wg->junk_size[MSGIDX_HANDSHAKE_COOKIE] + MESSAGE_COOKIE_REPLY_SIZE) {
+		skb_pull(skb, wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]);
+		if (mh_validate(assumed_type, &wg->headers[MSGIDX_HANDSHAKE_COOKIE]))
+			return MESSAGE_HANDSHAKE_COOKIE;
+		else
+			skb_push(skb, wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]);
+	}
+
+	if (skb->len >= wg->junk_size[MSGIDX_TRANSPORT] + MESSAGE_TRANSPORT_SIZE) {
+		skb_pull(skb, wg->junk_size[MSGIDX_TRANSPORT]);
+		if (mh_validate(assumed_type, &wg->headers[MSGIDX_TRANSPORT]))
+			return MESSAGE_TRANSPORT_SIZE;
+		else
+			skb_push(skb, wg->junk_size[MSGIDX_TRANSPORT]);
+	}
+
+	net_dbg_skb_ratelimited("%s: Unknown message from %pISpfsc encountered, packet dropped\n",
+								wg->dev->name, skb);
+
+	return 0;
 }
 
 static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
@@ -138,8 +119,7 @@ static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
 	if (unlikely(skb->len != data_len))
 		/* Final len does not agree with calculated len */
 		return -EINVAL;
-	prepare_advanced_secured_message(skb, wg);
-	header_len = validate_header_len(skb, wg);
+	header_len = prepare_awg_message(skb, wg);
 	if (unlikely(!header_len))
 		return -EINVAL;
 	__skb_push(skb, data_offset);
@@ -161,7 +141,7 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 	bool packet_needs_cookie;
 	bool under_load;
 
-	if (SKB_TYPE_LE32(skb, wg) == cpu_to_le32(wg->advanced_security_config.cookie_packet_magic_header)) {
+	if (mh_validate(SKB_TYPE_LE32(skb, wg), &wg->headers[MSGIDX_HANDSHAKE_COOKIE])) {
 		net_info_skb_ratelimited("%s: receiving cookie response from %pISpfsc\n",
 					wg->ndm_dev_name, skb);
 		wg_cookie_message_consume(
@@ -191,7 +171,7 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 		return;
 	}
 
-	if (SKB_TYPE_LE32(skb, wg) == cpu_to_le32(wg->advanced_security_config.init_packet_magic_header)) {
+	if (mh_validate(SKB_TYPE_LE32(skb, wg), &wg->headers[MSGIDX_HANDSHAKE_INIT])) {
 		struct timespec64 ts, last_handshake_ts;
 		struct message_handshake_initiation *message =
 			(struct message_handshake_initiation *)skb->data;
@@ -201,7 +181,7 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 							message->sender_index);
 			return;
 		}
-		peer = wg_noise_handshake_consume_initiation(message, wg);
+		peer = wg_noise_handshake_consume_initiation(message, wg, skb);
 		if (unlikely(!peer)) {
 			net_info_skb_ratelimited("%s: invalid handshake initiation from %pISpfsc\n",
 						wg->ndm_dev_name, skb);
@@ -220,7 +200,7 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 
 		wg_packet_send_handshake_response(peer);
 	} else
-	if (SKB_TYPE_LE32(skb, wg) == cpu_to_le32(wg->advanced_security_config.response_packet_magic_header)) {
+	if (mh_validate(SKB_TYPE_LE32(skb, wg), &wg->headers[MSGIDX_HANDSHAKE_RESPONSE])) {
 		struct message_handshake_response *message =
 			(struct message_handshake_response *)skb->data;
 
@@ -330,7 +310,8 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair,
 	 * call skb_cow_data, so that there's no chance that data is removed
 	 * from the skb, so that later we can extract the original endpoint.
 	 */
-	offset = skb->data - skb_network_header(skb);
+	// ??? offset = skb->data - skb_network_header(skb);
+	offset = -skb_network_offset(skb);
 	skb_push(skb, offset);
 	num_frags = skb_cow_data(skb, 0, &trailer);
 	offset += sizeof(struct message_data);
@@ -645,9 +626,9 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 	type = SKB_TYPE_LE32(skb, wg);
 	SKB_CLEAR_TYPE(skb, wg);
 
-	if (type == cpu_to_le32(wg->advanced_security_config.init_packet_magic_header) ||
-	    type == cpu_to_le32(wg->advanced_security_config.response_packet_magic_header) ||
-	    type == cpu_to_le32(wg->advanced_security_config.cookie_packet_magic_header)) {
+	if (mh_validate(type, &wg->headers[MSGIDX_HANDSHAKE_INIT]) ||
+		mh_validate(type, &wg->headers[MSGIDX_HANDSHAKE_RESPONSE]) ||
+		mh_validate(type, &wg->headers[MSGIDX_HANDSHAKE_COOKIE])) {
 		int cpu, ret = -EBUSY;
 
 		if (unlikely(!rng_is_initialized()))
@@ -670,7 +651,7 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 		/* Queues up a call to packet_process_queued_handshake_packets(skb): */
 		queue_work_on(cpu, wg->handshake_receive_wq,
 			      &per_cpu_ptr(wg->handshake_queue.worker, cpu)->work);
-	} else if (type == cpu_to_le32(wg->advanced_security_config.transport_packet_magic_header)) {
+	} else if (mh_validate(type, &wg->headers[MSGIDX_TRANSPORT])) {
 		PACKET_CB(skb)->ds = ip_tunnel_get_dsfield(ip_hdr(skb), skb);
 		wg_packet_consume_data(wg, skb);
 	} else {
