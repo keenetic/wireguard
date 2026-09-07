@@ -122,7 +122,9 @@ static int wg_stop(struct net_device *dev)
 		wg_timers_stop(peer);
 		wg_noise_handshake_clear(&peer->handshake);
 		wg_noise_keypairs_clear(&peer->keypairs);
-		wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake);
+		wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake,
+		peer->device->rekey_timeout ?
+		wg_range16_lo(peer->device->rekey_timeout) : REKEY_TIMEOUT);
 	}
 	mutex_unlock(&wg->device_update_lock);
 	while ((skb = ptr_ring_consume(&wg->handshake_queue.ring)) != NULL)
@@ -205,6 +207,7 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 		skb_dst_drop(skb);
 
 		PACKET_CB(skb)->mtu = mtu;
+		PACKET_CB(skb)->is_keepalive = false;
 
 		__skb_queue_tail(&packets, skb);
 	}
@@ -321,6 +324,7 @@ static void wg_setup(struct net_device *dev)
 
 	memset(wg, 0, sizeof(*wg));
 	wg->dev = dev;
+	init_rwsem(&wg->header_protection.lock);
 
 	wg->headers[MSGIDX_HANDSHAKE_INIT] = (struct magic_header) {
 		.start = MESSAGE_HANDSHAKE_INITIATION,

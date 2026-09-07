@@ -6,6 +6,7 @@
 #include "device.h"
 #include "peer.h"
 #include "socket.h"
+#include "header_protection.h"
 #include "queueing.h"
 #include "messages.h"
 
@@ -192,7 +193,13 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
 int wg_socket_send_buffer_to_peer(struct wg_peer *peer, void *buffer,
 				  size_t len, u8 ds, size_t junk_size)
 {
-	struct sk_buff *skb = alloc_skb(len + junk_size + SKB_HEADER_LEN, GFP_ATOMIC);
+	struct wg_device *wg = peer->device;
+	unsigned int trailer_len =
+		wg_peer_random_trailer(peer, wg, junk_size + len);
+	struct sk_buff *skb = alloc_skb(len + junk_size + trailer_len +
+					SKB_HEADER_LEN, GFP_ATOMIC);
+	u8 *nonce = NULL;
+	void *message;
 
 	if (unlikely(!skb))
 		return -ENOMEM;
@@ -201,14 +208,22 @@ int wg_socket_send_buffer_to_peer(struct wg_peer *peer, void *buffer,
 	skb_set_inner_network_header(skb, 0);
 
 	if (junk_size > 0) {
-		void* junk = skb_put(skb, junk_size);
-		get_random_bytes(junk, junk_size);
+		nonce = skb_put(skb, junk_size);
+		get_random_bytes(nonce, junk_size);
 	}
 
-	if (skb_put_data(skb, buffer, len) == NULL) {
+	message = skb_put_data(skb, buffer, len);
+	if (message == NULL) {
 		kfree_skb(skb);
 		return -ENOMEM;
 	}
+
+	if (trailer_len)
+		get_random_bytes(skb_put(skb, trailer_len), trailer_len);
+
+	if (nonce)
+		wg_header_protection_crypt(&wg->header_protection, nonce,
+					   message, len);
 
 	return wg_socket_send_skb_to_peer(peer, skb, ds);
 }
@@ -217,9 +232,13 @@ int wg_socket_send_buffer_as_reply_to_skb(struct wg_device *wg,
 					  struct sk_buff *in_skb, void *buffer,
 					  size_t len, size_t junk_size)
 {
+	unsigned int trailer_len =
+		wg_peer_random_trailer(NULL, wg, junk_size + len);
 	int ret = 0;
 	struct sk_buff *skb;
 	struct endpoint endpoint;
+	u8 *nonce = NULL;
+	void *message;
 
 	if (unlikely(!in_skb))
 		return -EINVAL;
@@ -227,18 +246,25 @@ int wg_socket_send_buffer_as_reply_to_skb(struct wg_device *wg,
 	if (unlikely(ret < 0))
 		return ret;
 
-	skb = alloc_skb(len + junk_size + SKB_HEADER_LEN, GFP_ATOMIC);
+	skb = alloc_skb(len + junk_size + trailer_len + SKB_HEADER_LEN,
+			GFP_ATOMIC);
 	if (unlikely(!skb))
 		return -ENOMEM;
 	skb_reserve(skb, SKB_HEADER_LEN);
 	skb_set_inner_network_header(skb, 0);
 
 	if (junk_size > 0) {
-		void* junk = skb_put(skb, junk_size);
-		get_random_bytes(junk, junk_size);
+		nonce = skb_put(skb, junk_size);
+		get_random_bytes(nonce, junk_size);
 	}
 
-	skb_put_data(skb, buffer, len);
+	message = skb_put_data(skb, buffer, len);
+	if (trailer_len)
+		get_random_bytes(skb_put(skb, trailer_len), trailer_len);
+
+	if (nonce)
+		wg_header_protection_crypt(&wg->header_protection, nonce,
+					   message, len);
 
 	if (endpoint.addr.sa_family == AF_INET)
 		ret = send4(wg, skb, &endpoint, 0, NULL, 0);
@@ -313,6 +339,7 @@ void wg_socket_set_peer_endpoint(struct wg_peer *peer,
 	dst_cache_reset(&peer->endpoint_cache);
 out:
 	write_unlock_bh(&peer->endpoint_lock);
+	WRITE_ONCE(peer->udp_window, DEFAULT_UDP_WINDOW);
 }
 
 void wg_socket_set_peer_endpoint_from_skb(struct wg_peer *peer,

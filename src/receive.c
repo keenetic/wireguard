@@ -3,6 +3,7 @@
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
+#include "header_protection.h"
 #include "queueing.h"
 #include "device.h"
 #include "peer.h"
@@ -48,43 +49,104 @@ bool client_id_asc_coexist(struct wg_device *wg)
 		wg->headers[MSGIDX_TRANSPORT].end <= 0xFF;
 }
 
+static bool awg_header_matches(struct sk_buff *skb, struct wg_device *wg,
+			       struct magic_header *header,
+			       __le32 protection_hash)
+{
+	__le32 type;
+
+	memcpy(&type, skb->data, sizeof(type));
+	type ^= protection_hash;
+	if (client_id_asc_coexist(wg))
+		type &= cpu_to_le32(0xFF);
+	return mh_validate(type, header);
+}
+
 static size_t prepare_awg_message(struct sk_buff *skb, struct wg_device *wg)
 {
+	u8 nonce[HEADER_PROTECTION_NONCE_SIZE];
+	__le32 protection_hash = 0;
+	bool protected;
+
 	if (skb_is_nonlinear(skb) && unlikely(skb_linearize(skb))) {
 		net_dbg_skb_ratelimited("%s: non-linear sk_buff from %pISpfsc could not be linearized, dropping packet\n",
 								wg->ndm_dev_name, skb);
 		return 0;
 	}
 
-	if (skb->len == wg->junk_size[MSGIDX_HANDSHAKE_INIT] + MESSAGE_INITIATION_SIZE) {
+	protected = wg_header_protection_enabled(&wg->header_protection);
+	if (protected) {
+		if (skb->len < HEADER_PROTECTION_NONCE_SIZE)
+			return 0;
+		memcpy(nonce, skb->data, sizeof(nonce));
+		wg_header_protection_hash(&wg->header_protection, nonce,
+					  (u8 *)&protection_hash);
+	}
+
+	if ((wg->random_trailers ?
+	     skb->len >= wg->junk_size[MSGIDX_HANDSHAKE_INIT] + MESSAGE_INITIATION_SIZE :
+	     skb->len == wg->junk_size[MSGIDX_HANDSHAKE_INIT] + MESSAGE_INITIATION_SIZE)) {
 		skb_pull(skb, wg->junk_size[MSGIDX_HANDSHAKE_INIT]);
-		if (mh_validate(SKB_TYPE_LE32(skb, wg), &wg->headers[MSGIDX_HANDSHAKE_INIT]))
+		if (awg_header_matches(skb, wg, &wg->headers[MSGIDX_HANDSHAKE_INIT],
+				       protection_hash)) {
+			if (wg->random_trailers &&
+			    unlikely(pskb_trim(skb, MESSAGE_INITIATION_SIZE)))
+				return 0;
+			if (protected &&
+			    !wg_header_protection_crypt(&wg->header_protection, nonce,
+							skb->data, MESSAGE_INITIATION_SIZE))
+				return 0;
 			return MESSAGE_INITIATION_SIZE;
-		else
+		} else
 			skb_push(skb, wg->junk_size[MSGIDX_HANDSHAKE_INIT]);
 	}
 
-	if (skb->len == wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE] + MESSAGE_RESPONSE_SIZE) {
+	if ((wg->random_trailers ?
+	     skb->len >= wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE] + MESSAGE_RESPONSE_SIZE :
+	     skb->len == wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE] + MESSAGE_RESPONSE_SIZE)) {
 		skb_pull(skb, wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]);
-		if (mh_validate(SKB_TYPE_LE32(skb, wg), &wg->headers[MSGIDX_HANDSHAKE_RESPONSE]))
+		if (awg_header_matches(skb, wg, &wg->headers[MSGIDX_HANDSHAKE_RESPONSE],
+				       protection_hash)) {
+			if (wg->random_trailers &&
+			    unlikely(pskb_trim(skb, MESSAGE_RESPONSE_SIZE)))
+				return 0;
+			if (protected &&
+			    !wg_header_protection_crypt(&wg->header_protection, nonce,
+							skb->data, MESSAGE_RESPONSE_SIZE))
+				return 0;
 			return MESSAGE_RESPONSE_SIZE;
-		else
+		} else
 			skb_push(skb, wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]);
 	}
 
-	if (skb->len == wg->junk_size[MSGIDX_HANDSHAKE_COOKIE] + MESSAGE_COOKIE_REPLY_SIZE) {
+	if ((wg->random_trailers ?
+	     skb->len >= wg->junk_size[MSGIDX_HANDSHAKE_COOKIE] + MESSAGE_COOKIE_REPLY_SIZE :
+	     skb->len == wg->junk_size[MSGIDX_HANDSHAKE_COOKIE] + MESSAGE_COOKIE_REPLY_SIZE)) {
 		skb_pull(skb, wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]);
-		if (mh_validate(SKB_TYPE_LE32(skb, wg), &wg->headers[MSGIDX_HANDSHAKE_COOKIE]))
+		if (awg_header_matches(skb, wg, &wg->headers[MSGIDX_HANDSHAKE_COOKIE],
+				       protection_hash)) {
+			if (wg->random_trailers &&
+			    unlikely(pskb_trim(skb, MESSAGE_COOKIE_REPLY_SIZE)))
+				return 0;
+			if (protected &&
+			    !wg_header_protection_crypt(&wg->header_protection, nonce,
+							skb->data, MESSAGE_COOKIE_REPLY_SIZE))
+				return 0;
 			return MESSAGE_HANDSHAKE_COOKIE;
-		else
+		} else
 			skb_push(skb, wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]);
 	}
 
 	if (skb->len >= wg->junk_size[MSGIDX_TRANSPORT] + MESSAGE_TRANSPORT_SIZE) {
 		skb_pull(skb, wg->junk_size[MSGIDX_TRANSPORT]);
-		if (mh_validate(SKB_TYPE_LE32(skb, wg), &wg->headers[MSGIDX_TRANSPORT]))
+		if (awg_header_matches(skb, wg, &wg->headers[MSGIDX_TRANSPORT],
+				       protection_hash)) {
+			if (protected &&
+			    !wg_header_protection_crypt(&wg->header_protection, nonce,
+							skb->data, MESSAGE_TRANSPORT_SIZE))
+				return 0;
 			return MESSAGE_TRANSPORT_SIZE;
-		else
+		} else
 			skb_push(skb, wg->junk_size[MSGIDX_TRANSPORT]);
 	}
 
@@ -287,7 +349,14 @@ static void keep_key_fresh(struct wg_peer *peer)
 	send = keypair && READ_ONCE(keypair->sending.is_valid) &&
 	       keypair->i_am_the_initiator &&
 	       wg_birthdate_has_expired(keypair->sending.birthdate,
-			REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT);
+			wg_range16_pick_or(peer->device->reject_after_time,
+					   REJECT_AFTER_TIME) -
+			(peer->device->keepalive_timeout ?
+			 wg_range16_lo(peer->device->keepalive_timeout) :
+			 KEEPALIVE_TIMEOUT) -
+			(peer->device->rekey_timeout ?
+			 wg_range16_lo(peer->device->rekey_timeout) :
+			 REKEY_TIMEOUT));
 	rcu_read_unlock_bh();
 
 	if (unlikely(send)) {
@@ -398,6 +467,7 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
 	struct net_device *dev = peer->device->dev;
 	unsigned int len, len_before_trim;
 	struct wg_peer *routed_peer;
+	u8 first_byte, *p;
 
 	wg_socket_set_peer_endpoint(peer, endpoint);
 
@@ -412,9 +482,10 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
 	wg_timers_any_authenticated_packet_received(peer);
 	wg_timers_any_authenticated_packet_traversal(peer);
 
-	/* A packet with length 0 is a keepalive packet */
-	if (unlikely(!skb->len)) {
-		update_rx_stats(peer, message_data_len(0));
+	/* Content padding may make an empty keepalive packet non-empty. */
+	p = skb_header_pointer(skb, 0, 1, &first_byte);
+	if (unlikely(!p || *p == 0)) {
+		update_rx_stats(peer, message_data_len(0) + skb->len);
 		if (peer->device->debug) {
 			net_info_peer_ratelimited("%s: receiving keepalive packet from peer \"%s\" (%llu) (%pISpfsc)\n",
 						peer, peer->internal_id,
@@ -552,6 +623,15 @@ int wg_packet_rx_poll(struct napi_struct *napi, int budget)
 
 		if (unlikely(wg_socket_endpoint_from_skb(&endpoint, skb)))
 			goto next;
+
+		{
+			u32 udp_window =
+				peer->device->junk_size[MSGIDX_TRANSPORT] +
+				MESSAGE_MINIMUM_LENGTH + skb->len;
+
+			if (READ_ONCE(peer->udp_window) < udp_window)
+				WRITE_ONCE(peer->udp_window, udp_window);
+		}
 
 		wg_reset_packet(skb, false);
 		wg_packet_consume_data_done(peer, skb, &endpoint);

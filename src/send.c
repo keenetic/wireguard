@@ -3,6 +3,7 @@
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
+#include "header_protection.h"
 #include "queueing.h"
 #include "timers.h"
 #include "device.h"
@@ -26,13 +27,25 @@ u32 wg_get_random_u32_inclusive(u32 floor, u32 ceil)
 	return floor + (get_random_u32() % diff);
 }
 
+static u16 wg_peer_rekey_timeout_min(struct wg_peer *peer)
+{
+	return peer->device->rekey_timeout ?
+		wg_range16_lo(peer->device->rekey_timeout) : REKEY_TIMEOUT;
+}
+
+static u16 wg_peer_rekey_after_time(struct wg_peer *peer)
+{
+	return wg_range16_pick_or(peer->device->rekey_after_time,
+				  REKEY_AFTER_TIME);
+}
+
 static void wg_packet_send_handshake_initiation(struct wg_peer *peer)
 {
 	struct message_handshake_initiation packet;
 	struct wg_device *wg = peer->device;
 
 	if (!wg_birthdate_has_expired(atomic64_read(&peer->last_sent_handshake),
-				      REKEY_TIMEOUT))
+				      wg_peer_rekey_timeout_min(peer)))
 		return; /* This function is rate limited. */
 
 	atomic64_set(&peer->last_sent_handshake, ktime_get_coarse_boottime_ns());
@@ -104,8 +117,12 @@ void wg_packet_handshake_send_worker(struct work_struct *work)
 void wg_packet_send_queued_handshake_initiation(struct wg_peer *peer,
 						bool is_retry)
 {
-	if (!is_retry)
+	if (!is_retry) {
 		peer->timer_handshake_attempts = 0;
+		peer->max_handshake_attempts =
+			wg_range16_pick_or(peer->device->max_handshake_attempts,
+					   MAX_TIMER_HANDSHAKES);
+	}
 
 	rcu_read_lock_bh();
 	/* We check last_sent_handshake here in addition to the actual function
@@ -113,7 +130,7 @@ void wg_packet_send_queued_handshake_initiation(struct wg_peer *peer,
 	 * necessary:
 	 */
 	if (!wg_birthdate_has_expired(atomic64_read(&peer->last_sent_handshake),
-				      REKEY_TIMEOUT) ||
+				      wg_peer_rekey_timeout_min(peer)) ||
 			unlikely(READ_ONCE(peer->is_dead)))
 		goto out;
 
@@ -174,6 +191,9 @@ void wg_packet_send_handshake_cookie(struct wg_device *wg,
 {
 	struct message_handshake_cookie packet;
 
+	if (wg->disable_cookies)
+		return;
+
 	net_info_skb_ratelimited("%s: Sending cookie response for denied handshake message for %pISpfsc\n",
 				wg->ndm_dev_name, initiating_skb);
 
@@ -191,7 +211,8 @@ static void keep_key_fresh(struct wg_peer *peer)
 	send = keypair && READ_ONCE(keypair->sending.is_valid) &&
 	       (atomic64_read(&keypair->sending_counter) > REKEY_AFTER_MESSAGES ||
 		(keypair->i_am_the_initiator &&
-		 wg_birthdate_has_expired(keypair->sending.birthdate, REKEY_AFTER_TIME)));
+		 wg_birthdate_has_expired(keypair->sending.birthdate,
+					  wg_peer_rekey_after_time(peer))));
 	rcu_read_unlock_bh();
 
 	if (unlikely(send))
@@ -219,16 +240,40 @@ static unsigned int calculate_skb_padding(struct sk_buff *skb)
 	return padded_size - last_unit;
 }
 
+static unsigned int calculate_skb_padding_addition(struct sk_buff *skb,
+						   u32 range)
+{
+	unsigned int addition = wg_range16_pick(range);
+	unsigned int packet_size = skb->len;
+	unsigned int space;
+
+	if (unlikely(!PACKET_CB(skb)->mtu))
+		return addition;
+	if (unlikely(packet_size > PACKET_CB(skb)->mtu))
+		packet_size %= PACKET_CB(skb)->mtu;
+
+	space = PACKET_CB(skb)->mtu - packet_size;
+	return min(addition, space);
+}
+
 static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 			   struct sk_buff *skb, struct noise_keypair *keypair,
 			   simd_context_t *simd_context)
 {
+	struct wg_peer *peer = keypair->entry.peer;
+	struct wg_device *wg = peer->device;
 	unsigned int padding_len, plaintext_len, trailer_len;
+	unsigned int udp_window;
 	struct scatterlist sg[MAX_SKB_FRAGS + 8];
 	struct message_data *header;
 	struct sk_buff *trailer;
+	u8 *nonce;
 	int num_frags;
 	bool res = false;
+
+	udp_window = junk_size + MESSAGE_MINIMUM_LENGTH + skb->len;
+	if (READ_ONCE(peer->udp_window) < udp_window)
+		WRITE_ONCE(peer->udp_window, udp_window);
 
 	/* Force hash calculation before encryption so that flow analysis is
 	 * consistent over the inner packet.
@@ -236,7 +281,14 @@ static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 	skb_get_hash(skb);
 
 	/* Calculate lengths. */
-	padding_len = calculate_skb_padding(skb);
+	if (wg->content_padding_addition)
+		padding_len = calculate_skb_padding_addition(
+			skb, wg->content_padding_addition);
+	else if (wg->random_trailers)
+		padding_len = wg_peer_random_trailer(peer, wg,
+			skb->len + MESSAGE_MINIMUM_LENGTH + junk_size);
+	else
+		padding_len = calculate_skb_padding(skb);
 	trailer_len = padding_len + noise_encrypted_len(0);
 	plaintext_len = skb->len + padding_len;
 
@@ -267,11 +319,17 @@ static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 	skb_set_inner_network_header(skb, 0);
 	header = (struct message_data *)skb_push(skb, sizeof(*header));
 	header->header.type = cpu_to_le32(message_type);
+	if (message_type <= 0xFF)
+		header->header.type |= cpu_to_be32(client_id & 0xFFFFFF);
 	header->key_idx = keypair->remote_index;
 	header->counter = cpu_to_le64(PACKET_CB(skb)->nonce);
 	pskb_put(skb, trailer, trailer_len);
 
-	get_random_bytes(skb_push(skb, junk_size), junk_size);
+	nonce = skb_push(skb, junk_size);
+	get_random_bytes(nonce, junk_size);
+	if (junk_size)
+		wg_header_protection_crypt(&wg->header_protection, nonce,
+					   (u8 *)header, sizeof(*header));
 
 	/* Now we can encrypt the scattergather segments */
 	sg_init_table(sg, num_frags);
@@ -282,9 +340,6 @@ static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 						   PACKET_CB(skb)->nonce,
 						   keypair->sending.key,
 						   simd_context);
-
-	if (message_type <= 0xFF)
-		header->header.type |= cpu_to_be32(client_id & 0xFFFFFF);
 
 	return res;
 }
@@ -301,6 +356,7 @@ void wg_packet_send_keepalive(struct wg_peer *peer)
 		skb_reserve(skb, DATA_PACKET_HEAD_ROOM);
 		skb->dev = peer->device->dev;
 		PACKET_CB(skb)->mtu = skb->dev->mtu;
+		PACKET_CB(skb)->is_keepalive = true;
 		skb_queue_tail(&peer->staged_packet_queue, skb);
 		if (peer->device->debug) {
 			net_info_peer_ratelimited("%s: sending keepalive packet to peer \"%s\" (%llu) (%pISpfsc)\n",
@@ -320,7 +376,7 @@ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *fir
 	wg_timers_any_authenticated_packet_traversal(peer);
 	wg_timers_any_authenticated_packet_sent(peer);
 	skb_list_walk_safe(first, skb, next) {
-		is_keepalive = skb->len == message_data_len(0);
+		is_keepalive = PACKET_CB(skb)->is_keepalive;
 		if (likely(!wg_socket_send_skb_to_peer(peer, skb,
 				PACKET_CB(skb)->ds) && !is_keepalive))
 			data_sent = true;

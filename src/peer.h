@@ -54,7 +54,9 @@ struct wg_peer {
 	struct timer_list timer_new_handshake, timer_zero_key_material;
 	struct timer_list timer_persistent_keepalive;
 	unsigned int timer_handshake_attempts;
-	u16 persistent_keepalive_interval;
+	u32 persistent_keepalive_interval;
+	u16 max_handshake_attempts;
+	u32 udp_window;
 	bool timer_need_another_keepalive;
 	bool sent_lastminute_handshake;
 	struct timespec64 walltime_last_handshake;
@@ -94,5 +96,18 @@ void wg_b64_encode(char *dst, const char *src, size_t len);
 
 int wg_peer_init(void);
 void wg_peer_uninit(void);
+
+#define DEFAULT_UDP_WINDOW 500
+
+static inline unsigned int wg_peer_random_trailer(struct wg_peer *peer,
+						   struct wg_device *wg,
+						   unsigned int size)
+{
+	unsigned int window = peer ? READ_ONCE(peer->udp_window) :
+				    DEFAULT_UDP_WINDOW;
+
+	return wg->random_trailers && window > size ?
+		get_random_u32() % (window - size) : 0;
+}
 
 #endif /* _WG_PEER_H */

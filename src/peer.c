@@ -37,6 +37,7 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
 		goto err;
 
 	peer->device = wg;
+	peer->udp_window = DEFAULT_UDP_WINDOW;
 	wg_noise_handshake_init(&peer->handshake, &wg->static_identity,
 				public_key, preshared_key, peer);
 	peer->internal_id = atomic64_inc_return(&peer_counter);
@@ -53,7 +54,9 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
 	rwlock_init(&peer->endpoint_lock);
 	kref_init(&peer->refcount);
 	skb_queue_head_init(&peer->staged_packet_queue);
-	wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake);
+	wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake,
+		peer->device->rekey_timeout ?
+		wg_range16_lo(peer->device->rekey_timeout) : REKEY_TIMEOUT);
 	peer->fwmark = 0;
 	peer->client_id = 0;
 	set_bit(NAPI_STATE_NO_BUSY_POLL, &peer->napi.state);

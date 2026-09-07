@@ -12,8 +12,10 @@
 #include "peerlookup.h"
 #include "cookie.h"
 #include "magic_header.h"
+#include "header_protection.h"
 
 #include <linux/types.h>
+#include <linux/random.h>
 #include <linux/netdevice.h>
 #include <linux/workqueue.h>
 #include <linux/mutex.h>
@@ -48,6 +50,34 @@ struct asc_config {
 	u16 junk_packet_max_size;
 };
 
+static inline u16 wg_range16_lo(u32 range)
+{
+	return (u16)range;
+}
+
+static inline u16 wg_range16_hi(u32 range)
+{
+	return (u16)(range >> 16);
+}
+
+static inline bool wg_range16_valid(u32 range)
+{
+	return wg_range16_lo(range) <= wg_range16_hi(range);
+}
+
+static inline u16 wg_range16_pick(u32 range)
+{
+	u16 lo = wg_range16_lo(range);
+	u16 hi = wg_range16_hi(range);
+
+	return lo + get_random_u32() % ((u32)hi - lo + 1);
+}
+
+static inline u16 wg_range16_pick_or(u32 range, u16 value)
+{
+	return range ? wg_range16_pick(range) : value;
+}
+
 struct wg_device {
 	struct net_device *dev;
 	struct crypt_queue encrypt_queue, decrypt_queue, handshake_queue;
@@ -62,11 +92,20 @@ struct wg_device {
 	struct mutex device_update_lock, socket_update_lock;
 	struct list_head device_list, peer_list;
 	struct asc_config advanced_security_config;
+	struct header_protection header_protection;
+	u32 content_padding_addition;
+	u32 rekey_after_time;
+	u32 rekey_timeout;
+	u32 reject_after_time;
+	u32 keepalive_timeout;
+	u32 max_handshake_attempts;
 	atomic_t handshake_queue_len;
 	unsigned int num_peers, device_update_gen;
 	u32 fwmark;
 	u16 incoming_port;
 	bool have_creating_net_ref;
+	bool random_trailers;
+	bool disable_cookies;
 	bool debug;
 	char ndm_dev_name[WG_NDM_NAME_SIZE];
 
