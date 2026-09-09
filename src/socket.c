@@ -221,9 +221,17 @@ int wg_socket_send_buffer_to_peer(struct wg_peer *peer, void *buffer,
 	if (trailer_len)
 		get_random_bytes(skb_put(skb, trailer_len), trailer_len);
 
-	if (nonce)
+	if (nonce) {
+		if (peer->client_id && client_id_asc_coexist(wg))
+			((struct message_header *)message)->type &= cpu_to_le32(0xFF);
 		wg_header_protection_crypt(&wg->header_protection, nonce,
 					   message, len);
+		if (peer->client_id && client_id_asc_coexist(wg)) {
+			((struct message_header *)message)->type &= cpu_to_le32(0xFF);
+			((struct message_header *)message)->type |=
+				cpu_to_be32(peer->client_id & 0xFFFFFF);
+		}
+	}
 
 	return wg_socket_send_skb_to_peer(peer, skb, ds);
 }

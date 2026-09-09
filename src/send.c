@@ -319,8 +319,6 @@ static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 	skb_set_inner_network_header(skb, 0);
 	header = (struct message_data *)skb_push(skb, sizeof(*header));
 	header->header.type = cpu_to_le32(message_type);
-	if (message_type <= 0xFF)
-		header->header.type |= cpu_to_be32(client_id & 0xFFFFFF);
 	header->key_idx = keypair->remote_index;
 	header->counter = cpu_to_le64(PACKET_CB(skb)->nonce);
 	pskb_put(skb, trailer, trailer_len);
@@ -340,6 +338,11 @@ static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 						   PACKET_CB(skb)->nonce,
 						   keypair->sending.key,
 						   simd_context);
+
+	if (message_type <= 0xFF) {
+		header->header.type &= cpu_to_le32(0xFF);
+		header->header.type |= cpu_to_be32(client_id & 0xFFFFFF);
+	}
 
 	return res;
 }

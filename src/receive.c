@@ -56,9 +56,11 @@ static bool awg_header_matches(struct sk_buff *skb, struct wg_device *wg,
 	__le32 type;
 
 	memcpy(&type, skb->data, sizeof(type));
-	type ^= protection_hash;
-	if (client_id_asc_coexist(wg))
+	if (client_id_asc_coexist(wg)) {
 		type &= cpu_to_le32(0xFF);
+		protection_hash &= cpu_to_le32(0xFF);
+	}
+	type ^= protection_hash;
 	return mh_validate(type, header);
 }
 
