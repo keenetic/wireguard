@@ -43,13 +43,13 @@ static void wg_expired_retransmit_handshake(struct timer_list *timer)
 	struct wg_peer *peer = from_timer(peer, timer,
 					  timer_retransmit_handshake);
 
-	if (peer->timer_handshake_attempts > MAX_TIMER_HANDSHAKES) {
+	if (peer->timer_handshake_attempts > peer->max_handshake_attempts) {
 		if ((!peer->device->debug &&
 			  peer->endpoint.addr.sa_family == AF_INET &&
 			 !ipv4_is_zeronet(peer->endpoint.addr4.sin_addr.s_addr)) ||
 				peer->device->debug) {
 			net_info_peer_ratelimited("%s: handshake for peer \"%s\" (%llu) (%pISpfsc) did not complete after %d attempts, giving up\n",
-				 peer, peer->internal_id, &peer->endpoint.addr, (int)MAX_TIMER_HANDSHAKES + 2);
+				 peer, peer->internal_id, &peer->endpoint.addr, (int)peer->max_handshake_attempts + 2);
 		}
 
 		del_timer(&peer->timer_send_keepalive);
@@ -63,7 +63,9 @@ static void wg_expired_retransmit_handshake(struct timer_list *timer)
 		 */
 		if (!timer_pending(&peer->timer_zero_key_material))
 			mod_peer_timer(peer, &peer->timer_zero_key_material,
-				       jiffies + REJECT_AFTER_TIME * 3 * HZ);
+				       jiffies + wg_range16_pick_or(
+					       peer->device->reject_after_time,
+					       REJECT_AFTER_TIME) * 3 * HZ);
 	} else {
 		++peer->timer_handshake_attempts;
 		if ((!peer->device->debug &&
@@ -92,7 +94,9 @@ static void wg_expired_send_keepalive(struct timer_list *timer)
 	if (peer->timer_need_another_keepalive) {
 		peer->timer_need_another_keepalive = false;
 		mod_peer_timer(peer, &peer->timer_send_keepalive,
-			       jiffies + KEEPALIVE_TIMEOUT * HZ);
+			       jiffies + wg_range16_pick_or(
+				       peer->device->keepalive_timeout,
+				       KEEPALIVE_TIMEOUT) * HZ);
 	}
 }
 
@@ -158,19 +162,28 @@ static void wg_expired_send_persistent_keepalive(struct timer_list *timer)
 /* Should be called after an authenticated data packet is sent. */
 void wg_timers_data_sent(struct wg_peer *peer)
 {
+	u16 keepalive_timeout = peer->device->keepalive_timeout ?
+		wg_range16_hi(peer->device->keepalive_timeout) :
+		KEEPALIVE_TIMEOUT;
+	u16 rekey_timeout = wg_range16_pick_or(peer->device->rekey_timeout,
+					       REKEY_TIMEOUT);
+
 	if (!timer_pending(&peer->timer_new_handshake))
 		mod_peer_timer(peer, &peer->timer_new_handshake,
-			jiffies + (KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) * HZ +
+			jiffies + (keepalive_timeout + rekey_timeout) * HZ +
 			prandom_u32_max(REKEY_TIMEOUT_JITTER_MAX_JIFFIES));
 }
 
 /* Should be called after an authenticated data packet is received. */
 void wg_timers_data_received(struct wg_peer *peer)
 {
+	u16 timeout = wg_range16_pick_or(peer->device->keepalive_timeout,
+					 KEEPALIVE_TIMEOUT);
+
 	if (likely(netif_running(peer->device->dev))) {
 		if (!timer_pending(&peer->timer_send_keepalive))
 			mod_peer_timer(peer, &peer->timer_send_keepalive,
-				       jiffies + KEEPALIVE_TIMEOUT * HZ);
+				       jiffies + timeout * HZ);
 		else
 			peer->timer_need_another_keepalive = true;
 	}
@@ -195,8 +208,11 @@ void wg_timers_any_authenticated_packet_received(struct wg_peer *peer)
 /* Should be called after a handshake initiation message is sent. */
 void wg_timers_handshake_initiated(struct wg_peer *peer)
 {
+	u16 timeout = wg_range16_pick_or(peer->device->rekey_timeout,
+					 REKEY_TIMEOUT);
+
 	mod_peer_timer(peer, &peer->timer_retransmit_handshake,
-		       jiffies + REKEY_TIMEOUT * HZ +
+		       jiffies + timeout * HZ +
 		       prandom_u32_max(REKEY_TIMEOUT_JITTER_MAX_JIFFIES));
 }
 
@@ -207,6 +223,9 @@ void wg_timers_handshake_complete(struct wg_peer *peer)
 {
 	del_timer(&peer->timer_retransmit_handshake);
 	peer->timer_handshake_attempts = 0;
+	peer->max_handshake_attempts =
+		wg_range16_pick_or(peer->device->max_handshake_attempts,
+				   MAX_TIMER_HANDSHAKES);
 	peer->sent_lastminute_handshake = false;
 	ktime_get_real_ts64(&peer->walltime_last_handshake);
 }
@@ -216,8 +235,11 @@ void wg_timers_handshake_complete(struct wg_peer *peer)
  */
 void wg_timers_session_derived(struct wg_peer *peer)
 {
+	u16 timeout = wg_range16_pick_or(peer->device->reject_after_time,
+					 REJECT_AFTER_TIME);
+
 	mod_peer_timer(peer, &peer->timer_zero_key_material,
-		       jiffies + REJECT_AFTER_TIME * 3 * HZ);
+		       jiffies + timeout * 3 * HZ);
 }
 
 /* Should be called before a packet with authentication, whether
@@ -227,7 +249,8 @@ void wg_timers_any_authenticated_packet_traversal(struct wg_peer *peer)
 {
 	if (peer->persistent_keepalive_interval)
 		mod_peer_timer(peer, &peer->timer_persistent_keepalive,
-			jiffies + peer->persistent_keepalive_interval * HZ);
+			jiffies + wg_range16_pick(
+				peer->persistent_keepalive_interval) * HZ);
 }
 
 void wg_timers_init(struct wg_peer *peer)
@@ -242,6 +265,9 @@ void wg_timers_init(struct wg_peer *peer)
 		    wg_expired_send_persistent_keepalive, 0);
 	INIT_WORK(&peer->clear_peer_work, wg_queued_expired_zero_key_material);
 	peer->timer_handshake_attempts = 0;
+	peer->max_handshake_attempts =
+		wg_range16_pick_or(peer->device->max_handshake_attempts,
+				   MAX_TIMER_HANDSHAKES);
 	peer->sent_lastminute_handshake = false;
 	peer->timer_need_another_keepalive = false;
 }
