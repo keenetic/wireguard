@@ -36,6 +36,7 @@
  *            WGPEER_A_ENDPOINT: NLA_MIN_LEN(struct sockaddr), struct sockaddr_in or struct sockaddr_in6
  *            WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL: NLA_U16
  *            WGPEER_A_LAST_HANDSHAKE_TIME: NLA_EXACT_LEN, struct __kernel_timespec
+ *            WGPEER_A_LAST_HANDSHAKE_TIME_MONOTONIC: NLA_U64, monotonic nanoseconds
  *            WGPEER_A_RX_BYTES: NLA_U64
  *            WGPEER_A_TX_BYTES: NLA_U64
  *            WGPEER_A_ALLOWEDIPS: NLA_NESTED
@@ -213,6 +214,7 @@ enum wgpeer_attribute {
 	WGPEER_A_ADVANCED_SECURITY,
 	WGPEER_A_FWMARK,
 	WGPEER_A_CLIENT_ID,
+	WGPEER_A_LAST_HANDSHAKE_TIME_MONOTONIC,
 	__WGPEER_A_LAST
 };
 #define WGPEER_A_MAX (__WGPEER_A_LAST - 1)

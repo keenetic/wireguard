@@ -228,6 +228,8 @@ void wg_timers_handshake_complete(struct wg_peer *peer)
 				   MAX_TIMER_HANDSHAKES);
 	peer->sent_lastminute_handshake = false;
 	ktime_get_real_ts64(&peer->walltime_last_handshake);
+	atomic64_set(&peer->last_handshake_monotonic_ns,
+		     ktime_to_ns(ktime_get()));
 }
 
 /* Should be called after an ephemeral key is created, which is before sending a
