@@ -128,11 +128,21 @@ static int get_allowedips(struct sk_buff *skb, const u8 *ip, u8 cidr,
 	return 0;
 }
 
+struct dump_ctx_info {
+	struct nlattr **attrs;
+};
+
 struct dump_ctx {
 	struct wg_device *wg;
 	struct wg_peer *next_peer;
 	u64 allowedips_seq;
 	struct allowedips_node *next_allowedip;
+	/* dump_info is only live until wg_get_device_start() returns. */
+	union {
+		/* 0: fixed attributes; 1..5: next I attribute; 6: done. */
+		u8 next_ispec;
+		struct dump_ctx_info dump_info;
+	};
 };
 
 #define DUMP_CTX(cb) ((struct dump_ctx *)(cb)->args)
@@ -239,10 +249,12 @@ static int wg_get_device_start(struct netlink_callback *cb)
 {
 	struct wg_device *wg;
 
+	BUILD_BUG_ON(sizeof(struct dump_ctx) > sizeof(cb->args));
 	wg = lookup_interface(genl_dumpit_info(cb)->attrs, cb->skb);
 	if (IS_ERR(wg))
 		return PTR_ERR(wg);
 	DUMP_CTX(cb)->wg = wg;
+	DUMP_CTX(cb)->next_ispec = 0;
 	return 0;
 }
 
@@ -281,14 +293,110 @@ static bool header_key_is_zero(const u8 key[HEADER_PROTECTION_KEY_SIZE])
 	return true;
 }
 
+static int wg_put_device_attrs(struct wg_device *wg, struct sk_buff *skb,
+			       struct dump_ctx *ctx)
+{
+	u8 header_key[HEADER_PROTECTION_KEY_SIZE];
+	unsigned int fixed_start = skb->len;
+	unsigned int i;
+	u64 h1, h2, h3, h4;
+	bool fail;
+
+	/* The fixed attributes are bounded and fit in a fresh dump skb. */
+	if (!ctx->next_ispec) {
+		h1 = pack_header_range(&wg->headers[MSGIDX_HANDSHAKE_INIT]);
+		h2 = pack_header_range(&wg->headers[MSGIDX_HANDSHAKE_RESPONSE]);
+		h3 = pack_header_range(&wg->headers[MSGIDX_HANDSHAKE_COOKIE]);
+		h4 = pack_header_range(&wg->headers[MSGIDX_TRANSPORT]);
+
+		fail = nla_put_u16(skb, WGDEVICE_A_LISTEN_PORT,
+				   wg->incoming_port) ||
+		       nla_put_u32(skb, WGDEVICE_A_FWMARK, wg->fwmark) ||
+		       nla_put_u32(skb, WGDEVICE_A_IFINDEX, wg->dev->ifindex) ||
+		       nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name) ||
+		       nla_put_u16(skb, WGDEVICE_A_JC,
+				   wg->advanced_security_config.junk_packet_count) ||
+		       nla_put_u16(skb, WGDEVICE_A_JMIN,
+				   wg->advanced_security_config.junk_packet_min_size) ||
+		       nla_put_u16(skb, WGDEVICE_A_JMAX,
+				   wg->advanced_security_config.junk_packet_max_size) ||
+		       nla_put_u16(skb, WGDEVICE_A_S1,
+				   wg->junk_size[MSGIDX_HANDSHAKE_INIT]) ||
+		       nla_put_u16(skb, WGDEVICE_A_S2,
+				   wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]) ||
+		       nla_put_u16(skb, WGDEVICE_A_S3,
+				   wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]) ||
+		       nla_put_u16(skb, WGDEVICE_A_S4,
+				   wg->junk_size[MSGIDX_TRANSPORT]) ||
+		       nla_put(skb, WGDEVICE_A_H1, sizeof(h1), &h1) ||
+		       nla_put(skb, WGDEVICE_A_H2, sizeof(h2), &h2) ||
+		       nla_put(skb, WGDEVICE_A_H3, sizeof(h3), &h3) ||
+		       nla_put(skb, WGDEVICE_A_H4, sizeof(h4), &h4) ||
+		       nla_put_u32(skb, WGDEVICE_A_CONTENT_PADDING_ADDITION,
+				   wg->content_padding_addition) ||
+		       nla_put_u32(skb, WGDEVICE_A_REKEY_AFTER_TIME,
+				   wg->rekey_after_time) ||
+		       nla_put_u32(skb, WGDEVICE_A_REKEY_TIMEOUT,
+				   wg->rekey_timeout) ||
+		       nla_put_u32(skb, WGDEVICE_A_REJECT_AFTER_TIME,
+				   wg->reject_after_time) ||
+		       nla_put_u32(skb, WGDEVICE_A_KEEPALIVE_TIMEOUT,
+				   wg->keepalive_timeout) ||
+		       nla_put_u32(skb, WGDEVICE_A_MAX_HANDSHAKE_ATTEMPTS,
+				   wg->max_handshake_attempts) ||
+		       nla_put_u8(skb, WGDEVICE_A_RANDOM_TRAILERS,
+				  wg->random_trailers) ||
+		       nla_put_u8(skb, WGDEVICE_A_DISABLE_COOKIES,
+				  wg->disable_cookies);
+		if (fail)
+			goto err_fixed;
+
+		if (wg_header_protection_enabled(&wg->header_protection)) {
+			wg_header_protection_get_key(&wg->header_protection,
+						     header_key);
+			fail = nla_put(skb, WGDEVICE_A_HEADER_PROTECTION_KEY,
+				       sizeof(header_key), header_key);
+			memzero_explicit(header_key, sizeof(header_key));
+			if (fail)
+				goto err_fixed;
+		}
+
+		down_read(&wg->static_identity.lock);
+		if (wg->static_identity.has_identity)
+			fail = nla_put(skb, WGDEVICE_A_PRIVATE_KEY,
+				       NOISE_PUBLIC_KEY_LEN,
+				       wg->static_identity.static_private) ||
+			       nla_put(skb, WGDEVICE_A_PUBLIC_KEY,
+				       NOISE_PUBLIC_KEY_LEN,
+				       wg->static_identity.static_public);
+		up_read(&wg->static_identity.lock);
+		if (fail)
+			goto err_fixed;
+
+		ctx->next_ispec = 1;
+	}
+
+	for (i = ctx->next_ispec - 1; i < ARRAY_SIZE(wg->ispecs); ++i) {
+		if (wg->ispecs[i].desc &&
+		    nla_put_string(skb, WGDEVICE_A_I1 + i, wg->ispecs[i].desc))
+			return -EMSGSIZE;
+		++ctx->next_ispec;
+	}
+
+	return 0;
+
+err_fixed:
+	skb_trim(skb, fixed_start);
+	return -EMSGSIZE;
+}
+
 static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	struct wg_peer *peer, *next_peer_cursor;
 	struct dump_ctx *ctx = DUMP_CTX(cb);
 	struct wg_device *wg = ctx->wg;
 	struct nlattr *peers_nest;
-	u8 header_key[HEADER_PROTECTION_KEY_SIZE];
-	u64 h1, h2, h3, h4;
+	unsigned int prev_msg_len;
 	int ret = -EMSGSIZE;
 	bool done = true;
 	void *hdr;
@@ -303,95 +411,31 @@ static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
 	if (!hdr)
 		goto out;
 	genl_dump_check_consistent(cb, hdr);
+	prev_msg_len = skb->len;
 
 	if (!ctx->next_peer) {
-		h1 = pack_header_range(&wg->headers[MSGIDX_HANDSHAKE_INIT]);
-		h2 = pack_header_range(&wg->headers[MSGIDX_HANDSHAKE_RESPONSE]);
-		h3 = pack_header_range(&wg->headers[MSGIDX_HANDSHAKE_COOKIE]);
-		h4 = pack_header_range(&wg->headers[MSGIDX_TRANSPORT]);
-
-		if (nla_put_u16(skb, WGDEVICE_A_LISTEN_PORT,
-				wg->incoming_port) ||
-		    nla_put_u32(skb, WGDEVICE_A_FWMARK, wg->fwmark) ||
-		    nla_put_u32(skb, WGDEVICE_A_IFINDEX, wg->dev->ifindex) ||
-		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name) ||
-		    nla_put_u16(skb, WGDEVICE_A_JC,
-				wg->advanced_security_config.junk_packet_count) ||
-		    nla_put_u16(skb, WGDEVICE_A_JMIN,
-				wg->advanced_security_config.junk_packet_min_size) ||
-		    nla_put_u16(skb, WGDEVICE_A_JMAX,
-				wg->advanced_security_config.junk_packet_max_size) ||
-		    nla_put_u16(skb, WGDEVICE_A_S1,
-				wg->junk_size[MSGIDX_HANDSHAKE_INIT]) ||
-		    nla_put_u16(skb, WGDEVICE_A_S2,
-				wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]) ||
-		    nla_put_u16(skb, WGDEVICE_A_S3,
-				wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]) ||
-		    nla_put_u16(skb, WGDEVICE_A_S4,
-				wg->junk_size[MSGIDX_TRANSPORT]) ||
-		    nla_put(skb, WGDEVICE_A_H1, sizeof(h1), &h1) ||
-		    nla_put(skb, WGDEVICE_A_H2, sizeof(h2), &h2) ||
-		    nla_put(skb, WGDEVICE_A_H3, sizeof(h3), &h3) ||
-		    nla_put(skb, WGDEVICE_A_H4, sizeof(h4), &h4) ||
-		    nla_put_u32(skb, WGDEVICE_A_CONTENT_PADDING_ADDITION,
-				wg->content_padding_addition) ||
-		    nla_put_u32(skb, WGDEVICE_A_REKEY_AFTER_TIME,
-				wg->rekey_after_time) ||
-		    nla_put_u32(skb, WGDEVICE_A_REKEY_TIMEOUT,
-				wg->rekey_timeout) ||
-		    nla_put_u32(skb, WGDEVICE_A_REJECT_AFTER_TIME,
-				wg->reject_after_time) ||
-		    nla_put_u32(skb, WGDEVICE_A_KEEPALIVE_TIMEOUT,
-				wg->keepalive_timeout) ||
-		    nla_put_u32(skb, WGDEVICE_A_MAX_HANDSHAKE_ATTEMPTS,
-				wg->max_handshake_attempts) ||
-		    nla_put_u8(skb, WGDEVICE_A_RANDOM_TRAILERS,
-				wg->random_trailers) ||
-		    nla_put_u8(skb, WGDEVICE_A_DISABLE_COOKIES,
-				wg->disable_cookies))
-			goto out;
-
-		if ((wg->ispecs[0].desc &&
-		     nla_put_string(skb, WGDEVICE_A_I1, wg->ispecs[0].desc)) ||
-		    (wg->ispecs[1].desc &&
-		     nla_put_string(skb, WGDEVICE_A_I2, wg->ispecs[1].desc)) ||
-		    (wg->ispecs[2].desc &&
-		     nla_put_string(skb, WGDEVICE_A_I3, wg->ispecs[2].desc)) ||
-		    (wg->ispecs[3].desc &&
-		     nla_put_string(skb, WGDEVICE_A_I4, wg->ispecs[3].desc)) ||
-		    (wg->ispecs[4].desc &&
-		     nla_put_string(skb, WGDEVICE_A_I5, wg->ispecs[4].desc)))
-			goto out;
-
-		if (wg_header_protection_enabled(&wg->header_protection)) {
-			wg_header_protection_get_key(&wg->header_protection,
-						     header_key);
-			if (nla_put(skb, WGDEVICE_A_HEADER_PROTECTION_KEY,
-				    sizeof(header_key), header_key)) {
-				memzero_explicit(header_key, sizeof(header_key));
+		ret = wg_put_device_attrs(wg, skb, ctx);
+		if (ret) {
+			if (ret != -EMSGSIZE || skb->len == prev_msg_len)
 				goto out;
-			}
-			memzero_explicit(header_key, sizeof(header_key));
-		}
 
-		down_read(&wg->static_identity.lock);
-		if (wg->static_identity.has_identity) {
-			if (nla_put(skb, WGDEVICE_A_PRIVATE_KEY,
-				    NOISE_PUBLIC_KEY_LEN,
-				    wg->static_identity.static_private) ||
-			    nla_put(skb, WGDEVICE_A_PUBLIC_KEY,
-				    NOISE_PUBLIC_KEY_LEN,
-				    wg->static_identity.static_public)) {
-				up_read(&wg->static_identity.lock);
-				goto out;
-			}
+			ret = 0;
+			done = false;
+			goto out;
 		}
-		up_read(&wg->static_identity.lock);
 	}
 
+	ret = -EMSGSIZE;
 	peers_nest = nla_nest_start(skb, WGDEVICE_A_PEERS);
-	if (!peers_nest)
+	if (!peers_nest) {
+		if (skb->len == prev_msg_len)
+			goto out;
+
+		ret = 0;
+		done = false;
 		goto out;
+	}
+
 	ret = 0;
 	lockdep_assert_held(&wg->device_update_lock);
 	/* If the last cursor was removed in peer_remove or peer_remove_all, then
