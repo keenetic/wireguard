@@ -73,6 +73,43 @@ static void awg_restore_protected_type(struct sk_buff *skb,
 	header->type |= protection_hash & cpu_to_le32(0xFFFFFF00);
 }
 
+static bool awg_is_known_transport_packet(struct sk_buff *skb,
+					  struct wg_device *wg, bool protected,
+					  const u8 nonce[HEADER_PROTECTION_NONCE_SIZE])
+{
+	struct {
+		struct message_header header;
+		__le32 key_idx;
+	} transport;
+	struct wg_peer *peer = NULL;
+	__le32 type;
+	bool known;
+
+	if (skb->len < wg->junk_size[MSGIDX_TRANSPORT] + MESSAGE_MINIMUM_LENGTH)
+		return false;
+
+	memcpy(&transport, skb->data + wg->junk_size[MSGIDX_TRANSPORT],
+	       sizeof(transport));
+	if (protected &&
+	    !wg_header_protection_crypt(&wg->header_protection, nonce,
+				       (u8 *)&transport, sizeof(transport)))
+		return false;
+
+	type = transport.header.type;
+	if (client_id_asc_coexist(wg))
+		type &= cpu_to_le32(0xFF);
+	if (!mh_validate(type, &wg->headers[MSGIDX_TRANSPORT]))
+		return false;
+
+	known = wg_index_hashtable_lookup(wg->index_hashtable,
+				  INDEX_HASHTABLE_KEYPAIR, transport.key_idx,
+				  &peer) != NULL;
+	if (known)
+		wg_peer_put(peer);
+
+	return known;
+}
+
 static size_t prepare_awg_message(struct sk_buff *skb, struct wg_device *wg)
 {
 	u8 nonce[HEADER_PROTECTION_NONCE_SIZE];
@@ -93,6 +130,10 @@ static size_t prepare_awg_message(struct sk_buff *skb, struct wg_device *wg)
 		wg_header_protection_hash(&wg->header_protection, nonce,
 					  (u8 *)&protection_hash);
 	}
+
+	if (wg->random_trailers &&
+	    awg_is_known_transport_packet(skb, wg, protected, nonce))
+		goto transport;
 
 	if ((wg->random_trailers ?
 	     skb->len >= wg->junk_size[MSGIDX_HANDSHAKE_INIT] + MESSAGE_INITIATION_SIZE :
@@ -160,6 +201,7 @@ static size_t prepare_awg_message(struct sk_buff *skb, struct wg_device *wg)
 		skb_push(skb, wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]);
 	}
 
+transport:
 	if (skb->len >= wg->junk_size[MSGIDX_TRANSPORT] + MESSAGE_TRANSPORT_SIZE) {
 		skb_pull(skb, wg->junk_size[MSGIDX_TRANSPORT]);
 		if (awg_header_matches(skb, wg, &wg->headers[MSGIDX_TRANSPORT],
