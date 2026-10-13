@@ -240,29 +240,13 @@ static unsigned int calculate_skb_padding(struct sk_buff *skb)
 	return padded_size - last_unit;
 }
 
-static unsigned int calculate_skb_padding_addition(struct sk_buff *skb,
-						   u32 range)
-{
-	unsigned int addition = wg_range16_pick(range);
-	unsigned int packet_size = skb->len;
-	unsigned int space;
-
-	if (unlikely(!PACKET_CB(skb)->mtu))
-		return addition;
-	if (unlikely(packet_size > PACKET_CB(skb)->mtu))
-		packet_size %= PACKET_CB(skb)->mtu;
-
-	space = PACKET_CB(skb)->mtu - packet_size;
-	return min(addition, space);
-}
-
 static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 			   struct sk_buff *skb, struct noise_keypair *keypair,
 			   simd_context_t *simd_context)
 {
 	struct wg_peer *peer = keypair->entry.peer;
 	struct wg_device *wg = peer->device;
-	unsigned int padding_len, plaintext_len, trailer_len;
+	unsigned int padding_len, plaintext_len, trailer_len, packet_len;
 	unsigned int udp_window;
 	struct scatterlist sg[MAX_SKB_FRAGS + 8];
 	struct message_data *header;
@@ -281,12 +265,12 @@ static bool encrypt_packet(u32 message_type, u32 client_id, size_t junk_size,
 	skb_get_hash(skb);
 
 	/* Calculate lengths. */
+	packet_len = skb->len + MESSAGE_MINIMUM_LENGTH + junk_size;
 	if (wg->content_padding_addition)
-		padding_len = calculate_skb_padding_addition(
-			skb, wg->content_padding_addition);
+		padding_len = wg_peer_skb_randomize_padding_addition(
+			peer, wg, packet_len);
 	else if (wg->random_trailers)
-		padding_len = wg_peer_random_trailer(peer, wg,
-			skb->len + MESSAGE_MINIMUM_LENGTH + junk_size);
+		padding_len = wg_peer_random_trailer(peer, wg, packet_len);
 	else
 		padding_len = calculate_skb_padding(skb);
 	trailer_len = padding_len + noise_encrypted_len(0);

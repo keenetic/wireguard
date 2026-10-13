@@ -111,4 +111,19 @@ static inline unsigned int wg_peer_random_trailer(struct wg_peer *peer,
 		get_random_u32() % (window - size) : 0;
 }
 
+static inline unsigned int wg_peer_skb_randomize_padding_addition(
+		struct wg_peer *peer, struct wg_device *wg, unsigned int size)
+{
+	unsigned int udp_window = peer ? READ_ONCE(peer->udp_window) :
+				       DEFAULT_UDP_WINDOW;
+	unsigned int addition, space;
+
+	if (udp_window < size)
+		return 0;
+
+	addition = wg_range16_pick(wg->content_padding_addition);
+	space = udp_window - size;
+	return min(addition, space);
+}
+
 #endif /* _WG_PEER_H */
