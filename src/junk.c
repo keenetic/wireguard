@@ -295,7 +295,6 @@ int jp_spec_setup(struct jp_spec *spec) {
     }
 
     if (pkt_size == 0 && mods_size == 0) {
-        /* Пустая спецификация — буферы не нужны */
         kfree(buf);
         mutex_unlock(&spec->lock);
         return 0;
