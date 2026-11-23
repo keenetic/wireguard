@@ -202,7 +202,7 @@ static size_t prepare_awg_message(struct sk_buff *skb, struct wg_device *wg)
 	}
 
 transport:
-	if (skb->len >= wg->junk_size[MSGIDX_TRANSPORT] + MESSAGE_TRANSPORT_SIZE) {
+	if (skb->len >= wg->junk_size[MSGIDX_TRANSPORT] + MESSAGE_MINIMUM_LENGTH) {
 		skb_pull(skb, wg->junk_size[MSGIDX_TRANSPORT]);
 		if (awg_header_matches(skb, wg, &wg->headers[MSGIDX_TRANSPORT],
 				       protection_hash)) {

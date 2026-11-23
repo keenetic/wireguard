@@ -289,6 +289,7 @@ static const struct device_type device_type = { .name = KBUILD_MODNAME };
 static void wg_setup(struct net_device *dev)
 {
 	struct wg_device *wg = netdev_priv(dev);
+	int i;
 	enum { WG_NETDEV_FEATURES = NETIF_F_HW_CSUM | NETIF_F_RXCSUM |
 				    NETIF_F_SG | NETIF_F_GSO |
 				    NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA };
@@ -324,6 +325,10 @@ static void wg_setup(struct net_device *dev)
 
 	memset(wg, 0, sizeof(*wg));
 	wg->dev = dev;
+
+	for (i = 0; i < ARRAY_SIZE(wg->ispecs); ++i)
+		mutex_init(&wg->ispecs[i].lock);
+
 	init_rwsem(&wg->header_protection.lock);
 
 	wg->headers[MSGIDX_HANDSHAKE_INIT] = (struct magic_header) {
